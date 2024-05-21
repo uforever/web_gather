@@ -1,3 +1,4 @@
+use std::string::String;
 use std::collections::{HashMap, HashSet};
 use std::env;
 use std::fs::{File, read_dir};
@@ -65,7 +66,7 @@ struct ServiceList {
 fn check_process_type(command: String) -> ProcessType {
     if command.contains("nginx") {
         return ProcessType::Nginx;
-    } else if command.contains("apache2") {
+    } else if command.contains("apache2") || command.contains("httpd") {
         return ProcessType::Apache2;
     } else if command.contains("tomcat") {
         return ProcessType::Tomcat;
@@ -354,58 +355,149 @@ fn get_nginx_urls(conf_path: &PathBuf, work_dir: &Path) -> Option<HashMap<u16, V
     return None;
 }
 
-fn get_apache_urls() -> Option<HashMap<u16, Vec<Url>>> {
+fn get_apache_urls(process: &Process) -> Option<HashMap<u16, Vec<Url>>> {
     let mut result: HashMap<u16, Vec<Url>> = HashMap::new();
-    let mut server_port: u16 = 0;
+    let mut vhost_port: u16 = 0;
+    let mut listen_ports: HashSet<u16> = HashSet::new();
 
-    let config_dir = PathBuf::from("/etc/apache2/sites-enabled/");
-    match read_dir(config_dir) {
-        Ok(entries) => {
-            for entry in entries {
-                let path = entry.unwrap().path();
-                if path.is_file() {
-                    if let Ok(file) = File::open(&path) {
-                        let reader = BufReader::new(file);
-                        for line in reader.lines() {
-                            if let Ok(line) = line {
-                                if line.is_empty() {
-                                    continue;
-                                }
-                                let pure_line = line.trim();
-                                if pure_line.starts_with('#') {
-                                    continue;
-                                }
-                                if pure_line.starts_with("<VirtualHost") {
-                                    let port = pure_line.split(':').last().unwrap().trim_end_matches('>');
-                                    match port.parse::<u16>() {
-                                        Ok(port) => server_port = port,
-                                        Err(_) => {}
+    // println!("{}", process.cmd()[0].as_str());
+
+    match Command::new(process.cmd()[0].as_str()).arg("-V").output() {
+        Ok(detail_output) => {
+
+            let detail_info_stdout = String::from_utf8_lossy(&detail_output.stdout);
+            let detail_info_stderr = String::from_utf8_lossy(&detail_output.stderr);
+
+            let detail_info = format!("{}{}", detail_info_stdout, detail_info_stderr);
+
+            // println!("{}", detail_info);
+
+            let re1 = Regex::new(r#"-D HTTPD_ROOT="([^"]+)""#).unwrap();
+            if let Some(captures) = re1.captures(&detail_info) {
+                if let Some(httpd_root) = captures.get(1) {
+                    let config_path = PathBuf::from(httpd_root.as_str());
+                    let re2 = Regex::new(r#"-D SERVER_CONFIG_FILE="([^"]+)""#).unwrap();
+                    if let Some(captures) = re2.captures(&detail_info) {
+                        if let Some(server_config_file) = captures.get(1) {
+                            let config_file = config_path.join(server_config_file.as_str());
+
+                            // 遍历配置文件
+                            if config_file.is_file() {
+                                if let Ok(file) = File::open(&config_file) {
+                                    let reader = BufReader::new(file);
+                                    for line in reader.lines() {
+                                        if let Ok(line) = line {
+                                            if line.is_empty() {
+                                                continue;
+                                            }
+                                            let pure_line = line.trim();
+                                            if pure_line.starts_with('#') {
+                                                continue;
+                                            }
+                                            if pure_line.starts_with("Listen") {
+                                                let port = pure_line.split_whitespace().nth(1).unwrap();
+                                                match port.parse::<u16>() {
+                                                    Ok(port) => {
+                                                        listen_ports.insert(port);
+                                                    },
+                                                    _ => {
+                                                        continue;
+                                                    }
+                                                }
+                                            }
+                                            if pure_line.starts_with("<VirtualHost") {
+                                                let port = pure_line.split(':').last().unwrap().trim_end_matches('>');
+                                                match port.parse::<u16>() {
+                                                    Ok(port) => vhost_port = port,
+                                                    Err(_) => {}
+                                                }
+                                            }
+                                            if pure_line.starts_with("DocumentRoot") {
+                                                let root_path_str = pure_line.split_whitespace().nth(1).unwrap().trim_matches('"');
+                                                let root_path = PathBuf::from(root_path_str);
+                                                if !root_path.is_absolute() {
+                                                    // server_port = 0;
+                                                    continue;
+                                                }
+                                                let urls = get_urls("/", &root_path);
+
+                                                if vhost_port == 0 {
+                                                    for port in listen_ports.iter() {
+                                                        result.insert(*port, urls.clone());
+                                                    }
+                                                } else {
+                                                    result.insert(vhost_port, urls);
+                                                }
+                                                // server_port = 0;
+                                            }
+                                            if pure_line.starts_with("</VirtualHost") {
+                                                vhost_port = 0;
+                                            }
+
+                                            if pure_line.contains("sites-enabled/*.conf") {
+                                                let config_dir = config_path.join("sites-enabled");
+                                                let mut current_port: u16 = 0;
+                                                match read_dir(config_dir) {
+                                                    Ok(entries) => {
+                                                        for entry in entries {
+                                                            let path = entry.unwrap().path();
+                                                            if path.is_file() {
+                                                                if let Ok(file) = File::open(&path) {
+                                                                    let reader = BufReader::new(file);
+                                                                    for line in reader.lines() {
+                                                                        if let Ok(line) = line {
+                                                                            if line.is_empty() {
+                                                                                continue;
+                                                                            }
+                                                                            let pure_line = line.trim();
+                                                                            if pure_line.starts_with('#') {
+                                                                                continue;
+                                                                            }
+                                                                            if pure_line.starts_with("<VirtualHost") {
+                                                                                let port = pure_line.split(':').last().unwrap().trim_end_matches('>');
+                                                                                match port.parse::<u16>() {
+                                                                                    Ok(port) => current_port = port,
+                                                                                    Err(_) => {}
+                                                                                }
+                                                                            }
+                                                                            if pure_line.starts_with("DocumentRoot") {
+                                                                                if current_port == 0 {
+                                                                                    continue;
+                                                                                }
+                                                                                let root_path_str = pure_line.split_whitespace().nth(1).unwrap();
+                                                                                let root_path = PathBuf::from(root_path_str);
+                                                                                if !root_path.is_absolute() {
+                                                                                    current_port = 0;
+                                                                                    continue;
+                                                                                }
+                                                                                let urls = get_urls("/", &root_path);
+                                                                                result.insert(current_port, urls);
+                                                                                current_port = 0;
+                                                                            }
+                                                                        }
+                                                                    }
+
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                    Err(_) => {}
+                                                }
+                                            }
+                                        }
                                     }
-                                }
-                                if pure_line.starts_with("DocumentRoot") {
-                                    if server_port == 0 {
-                                        continue;
-                                    }
-                                    let root_path_str = pure_line.split_whitespace().nth(1).unwrap();
-                                    let root_path = PathBuf::from(root_path_str);
-                                    if !root_path.is_absolute() {
-                                        server_port = 0;
-                                        continue;
-                                    }
-                                    let urls = get_urls("/", &root_path);
-                                    result.insert(server_port, urls);
-                                    server_port = 0;
                                 }
                             }
                         }
-                        return Some(result);
                     }
                 }
             }
+            return Some(result);
         }
-        Err(_) => {}
+        Err(_) => {
+            return None;
+        }
     }
-    return None;
 }
 
 fn get_tomcat_urls(catalina_base: &PathBuf) -> Option<HashMap<u16, Vec<Url>>> {
@@ -792,9 +884,11 @@ fn get_process_detail(process: &Process, process_type: &ProcessType) -> Option<H
             return get_nginx_urls(&nginx_conf_path, work_dir);
         }
         ProcessType::Apache2 => {
+
+            // println!("{:#?}", process);
             // return None;
             return if cfg!(target_os = "linux") {
-                get_apache_urls()
+                get_apache_urls(process)
             } else {
                 None
             };
@@ -838,7 +932,7 @@ fn get_process_detail(process: &Process, process_type: &ProcessType) -> Option<H
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // println!("---- START ----");
 
-    let mut unique_ports = HashSet::new();
+    let mut unique_ports: HashSet<u16> = HashSet::new();
     let mut non_web_pids = HashSet::new();
     let mut port_pid_map: HashMap<u16, u32> = HashMap::new();
     let mut web_processes: HashMap<u32, &Process> = HashMap::new();
@@ -854,6 +948,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     sys.refresh_all();
 
     let mut result = ServiceList { services: vec![] };
+
+    // println!("{:#?}", sockets_info);
 
     // 遍历开放端口
     for si in sockets_info {
